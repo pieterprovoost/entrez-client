@@ -19,7 +19,13 @@ class EntrezClient:
         ids = results["IdList"]
         return ids
 
-    def fetch(self, term: str, path: str, retmax: int = 1000000000, rettype: str = "fasta", retmode: str = "text"):
+    def download_ids(self, term: str, path: str, retmax: int = 1000000000):
+        ids = self.search(term, retmax=retmax)
+        with open(path, "w") as f:
+            for id in ids:
+                f.write(f"{id}\n")
+
+    def download(self, term: str, path: str, retmax: int = 1000000000, rettype: str = "fasta", retmode: str = "text"):
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
