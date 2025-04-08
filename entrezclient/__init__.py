@@ -25,6 +25,29 @@ class EntrezClient:
             for id in ids:
                 f.write(f"{id}\n")
 
+    def download_from_ids(self, ids: list[str], path: str, rettype: str = "fasta", retmode: str = "text", progress: Progress = None):
+        open(path, "w").close()
+        
+        offsets = range(0, len(ids), self.batch_size)
+        if progress:
+            task = progress.add_task("[green]Downloading", total=len(ids))
+
+        for start in offsets:
+            end = min(start + self.batch_size, len(ids))
+            batch_ids = ids[start:end]
+            while True:
+                try:
+                    handle = Entrez.efetch(db=self.db, id=",".join(batch_ids), rettype=rettype, retmode=retmode)
+                    with open(path, "a") as out_handle:
+                        records = SeqIO.parse(handle, "fasta")
+                        count = SeqIO.write(records, out_handle, "fasta")
+                    if progress:
+                        progress.update(task, advance=count)
+                    handle.close()
+                    break
+                except Exception as e:
+                    time.sleep(10)
+
     def download(self, term: str, path: str, retmax: int = 1000000000, rettype: str = "fasta", retmode: str = "text"):
         with Progress(
             SpinnerColumn(),
@@ -37,23 +60,4 @@ class EntrezClient:
             search_task = progress.add_task("[red]Searching", total=1)
             ids = self.search(term, retmax=retmax)
             progress.update(search_task, completed=1)
-
-            open(path, "w").close()
-            
-            offsets = range(0, len(ids), self.batch_size)
-            task = progress.add_task("[green]Downloading", total=len(ids))
-
-            for start in offsets:
-                end = min(start + self.batch_size, len(ids))
-                batch_ids = ids[start:end]
-                while True:
-                    try:
-                        handle = Entrez.efetch(db=self.db, id=",".join(batch_ids), rettype=rettype, retmode=retmode)
-                        with open(path, "a") as out_handle:
-                            records = SeqIO.parse(handle, "fasta")
-                            count = SeqIO.write(records, out_handle, "fasta")
-                        progress.update(task, advance=count)
-                        handle.close()
-                        break
-                    except Exception as e:
-                        time.sleep(10)
+            self.download_from_ids(ids, path, rettype=rettype, retmode=retmode, progress=progress)
