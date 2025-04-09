@@ -1,16 +1,25 @@
 from Bio import Entrez, SeqIO
 import time
 from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn, SpinnerColumn, MofNCompleteColumn
+import diskcache as dc
+from multiprocessing import Pool, Lock, Manager
+import os
+import logging
+from io import StringIO
+import shutil
 
 
 class EntrezClient:
-    def __init__(self, email: str, api_key: str, db: str = "nucleotide"):
-        self.email = email
-        self.api_key = api_key
+    def __init__(self, db: str = "nucleotide"):
         self.db = db
-        self.batch_size = 1000
-        Entrez.email = email
-        Entrez.api_key = api_key
+        self.WORK_DIR = 'queue_work'
+        self.PENDING_DIR = 'queue_pending'
+        self.RESULTS_DIR = 'results'
+        self.BATCH_SIZE = 100
+        self.NUM_WORKERS = 2
+
+        self.work = dc.Deque(directory=self.WORK_DIR)
+        self.pending = dc.Deque(directory=self.PENDING_DIR)
 
     def search(self, term: str, retmax: int = 1000000000):
         handle = Entrez.esearch(db=self.db, term=term, retmax=retmax)
@@ -19,45 +28,65 @@ class EntrezClient:
         ids = results["IdList"]
         return ids
 
-    def download_ids(self, term: str, path: str, retmax: int = 1000000000):
+    def recover_pending(self):
+        logging.info(f"Recovering {len(self.pending)} pending items")
+        while self.pending:
+            self.work.append(self.pending.popleft())
+
+    def initialize(self, term: str, retmax: int = 1000000000):
+        self.work.clear()
+        self.pending.clear()
+        if os.path.exists(self.RESULTS_DIR):
+            shutil.rmtree(self.RESULTS_DIR)
+        os.mkdir(self.RESULTS_DIR)
         ids = self.search(term, retmax=retmax)
-        with open(path, "w") as f:
-            for id in ids:
-                f.write(f"{id}\n")
+        self.work.extend(ids)
 
-    def download_from_ids(self, ids: list[str], path: str, rettype: str = "fasta", retmode: str = "text", progress: Progress = None):
-        open(path, "w").close()
-        
-        offsets = range(0, len(ids), self.batch_size)
-        if progress:
-            task = progress.add_task("[green]Downloading", total=len(ids))
+    @staticmethod
+    def worker(num: int, work_dir: str, pending_dir: str, results_dir: str, batch_size: int, db: str, rettype: str, retmode: str):
+        work = dc.Deque(directory=work_dir)
+        pending = dc.Deque(directory=pending_dir)
 
-        for start in offsets:
-            end = min(start + self.batch_size, len(ids))
-            batch_ids = ids[start:end]
+        while True:
+            ids = []
+            for _ in range(batch_size):
+                try:
+                    new_id = work.popleft()
+                    ids.append(new_id)
+                    pending.append(new_id)
+                except IndexError:
+                    break
+            if not ids:
+                break
+
+            logging.info(f"Worker {num} processing {len(ids)} items")
+
             while True:
                 try:
-                    handle = Entrez.efetch(db=self.db, id=",".join(batch_ids), rettype=rettype, retmode=retmode)
-                    with open(path, "a") as out_handle:
+                    handle = Entrez.efetch(db=db, id=",".join(ids), rettype=rettype, retmode=retmode)
+                    filename = f"worker_{num}_{int(time.time())}.fasta"
+                    with open(os.path.join(results_dir, filename), "a") as out_handle:
                         records = SeqIO.parse(handle, "fasta")
                         count = SeqIO.write(records, out_handle, "fasta")
-                    if progress:
-                        progress.update(task, advance=count)
                     handle.close()
+                    logging.info(f"Worker {num} wrote {count} items to results")
+
+                    for id in ids:
+                        pending.remove(id)
+
                     break
                 except Exception as e:
+                    if os.path.exists(os.path.join(results_dir, filename)):
+                        os.remove(os.path.join(results_dir, filename))
+                    logging.info(f"Worker {num} encountered exception, waiting for retry: {e}")
                     time.sleep(10)
 
-    def download(self, term: str, path: str, retmax: int = 1000000000, rettype: str = "fasta", retmode: str = "text"):
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            TimeRemainingColumn(),
-        ) as progress:
-            search_task = progress.add_task("[red]Searching", total=1)
-            ids = self.search(term, retmax=retmax)
-            progress.update(search_task, completed=1)
-            self.download_from_ids(ids, path, rettype=rettype, retmode=retmode, progress=progress)
+    def download(self, path: str, rettype: str = "fasta", retmode: str = "text"):
+        self.recover_pending()
+        logging.info(f"Found {len(self.work)} items in work queue")
+
+        time.sleep(5)
+
+        with Pool(processes=self.NUM_WORKERS) as pool:
+            args = [(i, self.WORK_DIR, self.PENDING_DIR, self.RESULTS_DIR, self.BATCH_SIZE, self.db, rettype, retmode) for i in range(self.NUM_WORKERS)]
+            pool.starmap(self.worker, args)
