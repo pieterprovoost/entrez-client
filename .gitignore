@@ -7,3 +7,5 @@ dist
 *.egg-info
 queue_*
 results
+temp_results
+*.fasta
